@@ -53,45 +53,38 @@ def image_data_url(path: Path) -> str:
 
 
 def build_chain() -> Any:
-    from langchain_core.output_parsers import StrOutputParser
     from langchain_core.prompts import ChatPromptTemplate
+    from langchain_core.output_parsers import StrOutputParser
     from langchain_deepseek import ChatDeepSeek
+
     model = ChatDeepSeek(
         model="deepseek-v4-flash-vision-exp",
         temperature=0,
-        max_tokens=4096,
+        max_tokens=1500,
         timeout=60,
         max_retries=1,
     )
+
     task = """
-Transcribe one supermarket receipt. Return JSON only:
-{{"payment":null,"subtotal":null,"rounding":null,
-"charges":[],"discounts":[]}}
-Use decimal strings for money. Each charges/discounts entry must be:
-{{"label":"short printed label","amount":"decimal string"}}
-payment: actual final payment after ROUNDING, not cash tendered,
-change, card balance, or a duplicated payment record.
-subtotal: printed SUBTOTAL / 小計 before ROUNDING.
-rounding: printed signed ROUNDING adjustment; "0.00" if absent.
-charges: every non-discount transaction line contributing to SUBTOTAL,
-including goods, plastic bags and other fees. Preserve printed signs.
-discounts: every applied discount, promotion, coupon, member/app saving,
-MB PRICE, packaging reduction and percentage-off line, as positive amounts.
-Copy the rightmost posted line amounts exactly. Promotional wording may
-contain a DIFFERENT amount; use the actual posted amount, not that wording.
-Extended line totals already include quantity: do not multiply them again.
-Keep repeated transaction lines as separate entries. Do not deduplicate.
-Exclude SUBTOTAL, ROUNDING, payments, change, balances, points and savings
-summaries from both lists. Never count a discount twice.
-Do not recalculate percentage discounts or invent unprinted discounts.
-Use null for unreadable money; never replace unreadable values with zero.
-Transcribe what is printed; never adjust amounts to force an equation.
-Reading strategy: {strategy}
-Diagnostic history, if supplied (may contain mistakes):
-{history}
+Read this receipt and return JSON only:
+{{"paid":null,"subtotal":null,"rounding":null,"items":[],"discounts":[]}}
+Use decimal strings for amounts, and arrays of decimal strings for the lists.
+paid: final amount paid, not cash tendered, change, balance or duplicate payment.
+subtotal: printed SUBTOTAL / 小計 before rounding.
+rounding: signed ROUNDING adjustment; use "0.00" only when absent.
+items: all posted item and fee totals, including plastic bags; preserve signs.
+discounts: positive magnitudes of ALL applied discount lines, including coupons,
+member/app offers, MB PRICE, packaging reductions and percentage discounts.
+Copy actual rightmost posted amounts, not amounts inside promotional wording.
+Keep repeated lines. Line totals already include quantity; do not multiply again.
+Exclude subtotal, rounding, payments, change, balances and savings summaries
+from both lists. Do not recalculate percentages or invent missing amounts.
+Use null for unreadable values. Output no labels or explanations.
+{feedback}
 """.strip()
+
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "Accurately transcribe English and Chinese receipts."),
+        ("system", "Read English and Chinese receipts accurately."),
         ("human", [
             {"type": "text", "text": task},
             {"type": "image_url", "image_url": {"url": "{image_url}"}},
@@ -101,145 +94,71 @@ Diagnostic history, if supplied (may contain mistakes):
 
 
 def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
-    from collections import Counter
     zero = Decimal("0.00")
-    cent = Decimal("0.01")
+
     def money(value):
-        text = str(value).strip()
-        if not re.fullmatch(r"-?\d+(?:\.\d{1,2})?", text):
-            raise ValueError("Missing or invalid decimal amount")
-        return Decimal(text).quantize(cent)
-    def amounts(data, field):
-        rows = data[field]
-        if not isinstance(rows, list):
-            raise ValueError(f"{field} must be a list")
-        values = [money(row["amount"]) for row in rows]
-        if field == "discounts":
-            values = [abs(value) for value in values]
-        return tuple(sorted(value for value in values if value != zero))
-    def consensus(votes):
-        ranked = votes.most_common(2)
-        if ranked and ranked[0][1] >= 2:
-            if len(ranked) == 1 or ranked[0][1] > ranked[1][1]:
-                return ranked[0][0]
-        return None
-    states = []
-    for path in images:
-        state = {
-            "path": path,
-            "url": None,
-            "paid": Counter(),
-            "full": Counter(),
-            "history": [],
-        }
-        try:
-            state["url"] = image_data_url(path)
-        except Exception as exc:
-            print(f"Cannot open {path.name}: {type(exc).__name__}")
-        states.append(state)
-    strategies = [
-        "Read from top to bottom, recording every posted transaction line.",
-        "Read independently from bottom to top. Check every amount and sign.",
-        "Read independently. Match each amount to its printed row; check "
-        "bag fees, repeated rows, promotions and faint decimal digits.",
-        "Audit the image using the diagnostic history. Resolve omissions "
-        "and disagreements from printed evidence, not from candidate votes.",
-        "Make a fresh independent transcription. Recheck the amount column "
-        "digit by digit, keeping every applied discount and charge.",
-    ]
-    for attempt, strategy in enumerate(strategies):
-        pending = [
-            state for state in states
-            if state["url"] is not None
-            and (
-                consensus(state["paid"]) is None
-                or consensus(state["full"]) is None
-            )
-        ]
+        number = Decimal(str(value).replace(",", ""))
+        if not number.is_finite() or number != number.quantize(Decimal("0.01")):
+            raise ValueError("Invalid money value")
+        return number
+
+    def parse(text):
+        data = json.loads(text[text.index("{"):text.rindex("}") + 1])
+        subtotal = money(data["subtotal"])
+        expected_paid = subtotal + money(data["rounding"])
+        paid = money(data["paid"]) if data.get("paid") is not None else expected_paid
+        if not all(isinstance(data[key], list) for key in ("items", "discounts")):
+            raise ValueError("Expected amount lists")
+        original = subtotal + sum((abs(money(x)) for x in data["discounts"]), zero)
+        item_total = sum((money(x) for x in data["items"]), zero)
+        return [(paid, paid == expected_paid), (original, original == item_total)]
+
+    inputs = [{"image_url": image_data_url(path), "feedback": ""} for path in images]
+    records = [[None, None] for _ in images]
+
+    for _ in range(2):
+        pending = [i for i, row in enumerate(records) if any(x is None or not x[1] for x in row)]
         if not pending:
             break
-        inputs = [
-            {
-                "image_url": state["url"],
-                "strategy": strategy,
-                "history": (
-                    json.dumps(state["history"][-3:], ensure_ascii=False)
-                    if attempt == 3 else "No previous transcription supplied."
-                ),
-            }
-            for state in pending
-        ]
         try:
             outputs = chain.batch(
-                inputs,
+                [inputs[i] for i in pending],
                 config={"max_concurrency": 3},
                 return_exceptions=True,
             )
         except Exception as exc:
             outputs = [exc] * len(pending)
-        for state, output in zip(pending, outputs):
-            errors = []
-            if isinstance(output, BaseException):
-                text = f"API request failed: {type(output).__name__}"
-                data = None
-                errors.append(text)
-            else:
+
+        for i, output in zip(pending, outputs):
+            try:
+                if isinstance(output, BaseException):
+                    raise output
                 text = response_text(output)
-                try:
-                    data = json.loads(text[text.index("{"):text.rindex("}") + 1])
-                    if not isinstance(data, dict):
-                        raise ValueError("Expected a JSON object")
-                except Exception:
-                    data = None
-                    errors.append("Invalid JSON object")
-            if data is not None:
-                try:
-                    subtotal = money(data["subtotal"])
-                    rounding = money(data["rounding"])
-                    paid = subtotal + rounding
-                    if data.get("payment") is not None:
-                        if money(data["payment"]) != paid:
-                            raise ValueError("Payment != SUBTOTAL + ROUNDING")
-                    state["paid"][(paid, subtotal, rounding)] += 1
-                except Exception as exc:
-                    errors.append(f"Payment check: {exc}")
-                try:
-                    subtotal = money(data["subtotal"])
-                    charges = amounts(data, "charges")
-                    discounts = amounts(data, "discounts")
-                    difference = sum(charges, zero) - sum(discounts, zero) - subtotal
-                    if difference != zero:
-                        raise ValueError(f"Charges - discounts - SUBTOTAL = {difference}")
-                    state["full"][(subtotal, charges, discounts)] += 1
-                except Exception as exc:
-                    errors.append(f"Ledger check: {exc}")
-            state["history"].append({
-                "transcription": text[:12000],
-                "validation_errors": errors,
-            })
-    total_paid = zero
-    total_full = zero
-    paid_ok = full_ok = True
-    for state in states:
-        paid = consensus(state["paid"])
-        full = consensus(state["full"])
-        if paid is None:
-            paid_ok = False
-        else:
-            total_paid += paid[0]
-        if full is None:
-            full_ok = False
-        else:
-            total_full += full[0] + sum(full[2], zero)
-        paid_text = f"HK${paid[0]:.2f}" if paid is not None else "UNRESOLVED"
-        full_text = (
-            f"HK${full[0] + sum(full[2], zero):.2f}"
-            if full is not None else "UNRESOLVED"
-        )
-        print(f"{state['path'].name}: paid={paid_text}, without_discount={full_text}")
+                values = parse(text)
+                for j in range(2):
+                    if records[i][j] is None or not records[i][j][1]:
+                        records[i][j] = values[j]
+                inputs[i]["feedback"] = (
+                    f"Re-read the image and correct this draft: {text}\n"
+                    f"Payment reconciles: {values[0][1]}. "
+                    f"Items reconcile: {values[1][1]}. "
+                    "Check each printed digit; never invent values to force agreement."
+                )
+            except Exception as exc:
+                print(f"{images[i].name}: {type(exc).__name__}, status={getattr(exc, 'status_code', None)}")
+                inputs[i]["feedback"] = "Previous attempt failed. Read the image again and return the full JSON."
+
+    for path, row in zip(images, records):
+        if any(x is None or not x[1] for x in row):
+            print(f"Warning: {path.name} still has unverified amounts; inspect the test results.")
+
     return {
-        QUERY_1: f"HK${total_paid:.2f}" if paid_ok else "ERROR: payment unresolved",
-        QUERY_2: f"HK${total_full:.2f}" if full_ok else "ERROR: receipt ledger unresolved",
+        query: (
+            f"HK${sum((row[j][0] for row in records), zero):.2f}"
+            if all(row[j] is not None for row in records)
+            else "ERROR: receipt data could not be read"
+        )
+        for j, query in enumerate((QUERY_1, QUERY_2))
     }
 
 
