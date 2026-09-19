@@ -48,16 +48,19 @@ DeepSeek Flash model. JPEG, PNG, GIF, and WebP inputs are accepted by the
 homework runner.
 
 
-## Homework 1 solution: 
+## Homework 1 solution
+
 ```mermaid
 flowchart TD
-    A["Receipt images"] --> B["Encode as data URLs"]
-    B --> C["Parallel vision extraction"]
-    C --> D{"Valid JSON and arithmetic?"}
-    D -- "Yes" --> F["Decimal normalization and aggregation"]
-    D -- "No" --> E["Repair prompt rereads image"]
-    E --> F
-    F --> G["Two single-amount answers"]
-    G --> H["results.csv"]
+    A["Receipt images"] --> B["JSON extraction with up to 3 concurrent calls"]
+    B --> C["Parse amounts and check arithmetic with Decimal"]
+    C --> D{"Any missing values or failed checks?"}
+    D -- Yes --> E["Re-read affected receipts with feedback once"]
+    E --> F["Repeat checks; keep values that passed and update others"]
+    F --> G["Warn if any values remain unverified"]
+    D -- No --> H["Sum receipt amounts or return a missing-data error"]
+    G --> H
+    H --> I["Runner evaluates answers and writes results.csv"]
 ```
-The solution uses the required `deepseek-v4-flash-vision-exp` model through LangChain. Each receipt is processed independently with LangChain's `batch` method so that the vision-extraction calls can run in parallel. The model extracts the final payment after rounding, the subtotal before rounding, and every applicable discount into a fixed JSON structure. Python then validates the structure and arithmetic with `Decimal`, routes malformed or inconsistent responses to a repair prompt, and deterministically aggregates the values across all receipts. The final dictionary contains the two exact query strings and returns only one HKD amount for each query.
+
+The solution combines parallel extraction, conditional review, and Python arithmetic through a LangChain pipeline: `ChatPromptTemplate → ChatDeepSeek → StrOutputParser`. It uses `deepseek-v4-flash-vision-exp` with JSON output, thinking disabled, and temperature `0`. Each receipt is extracted into `paid`, `subtotal`, `rounding`, `items`, and `discounts`, with at most three concurrent requests. Python validates monetary values and performs calculations with `Decimal`. For each receipt, Question 1 uses the final payment, falling back to `subtotal + rounding` when `paid` is absent or null. Question 2 uses the subtotal plus the absolute amounts of all applied discounts, excluding rounding. Arithmetic checks compare the payment with `subtotal + rounding` and the Question 2 amount with the sum of item and fee amounts. Only receipts with missing values or failed checks receive one additional extraction with feedback; values that already passed their checks are retained while other values are updated. There are at most two extraction rounds, separate from the configured API retry. If checks remain unresolved but all required values are available, the program prints a warning and still includes those values in the totals. If a required value is missing, the affected question returns `ERROR: receipt data could not be read`. The provided runner evaluates the completed answers and writes `results.csv`; public ground truth is used for scoring after inference. The solution functions contain no hard-coded receipt filenames or expected answers. These checks establish arithmetic consistency, not guaranteed image-recognition accuracy.
