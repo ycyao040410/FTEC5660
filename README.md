@@ -50,4 +50,17 @@ homework runner.
 
 ## Homework 1 solution: 
 > to students: please fill your solution description here.
+## Homework 1 solution
 
+```mermaid
+flowchart TD
+    A["Receipt images"] --> B["Encode as data URLs"]
+    B --> C["Parallel vision extraction"]
+    C --> D{"Valid JSON and arithmetic?"}
+    D -- "Yes" --> F["Decimal normalization and aggregation"]
+    D -- "No" --> E["Repair prompt rereads image"]
+    E --> F
+    F --> G["Two single-amount answers"]
+    G --> H["results.csv"]
+```
+The solution uses the required `deepseek-v4-flash-vision-exp` model through LangChain. Each receipt is processed independently with LangChain's `batch` method so that the vision-extraction calls can run in parallel. The model extracts the final payment after rounding, the subtotal before rounding, and every applicable discount into a fixed JSON structure. Python then validates the structure and arithmetic with `Decimal`, routes malformed or inconsistent responses to a repair prompt, and deterministically aggregates the values across all receipts. The final dictionary contains the two exact query strings and returns only one HKD amount for each query.
