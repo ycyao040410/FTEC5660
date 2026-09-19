@@ -49,9 +49,6 @@ homework runner.
 
 
 ## Homework 1 solution: 
-> to students: please fill your solution description here.
-## Homework 1 solution
-
 ```mermaid
 flowchart TD
     A["Receipt images"] --> B["Encode as data URLs"]
