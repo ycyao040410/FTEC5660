@@ -53,34 +53,121 @@ def image_data_url(path: Path) -> str:
 
 
 def build_chain() -> Any:
-    """Create and return your LangChain chain once.
-
-    Suggested imports:
-        from langchain_core.prompts import ChatPromptTemplate
-        from langchain_deepseek import ChatDeepSeek
-
-    Use the vision-capable DeepSeek Flash model named
-    ``deepseek-v4-flash-vision-exp``. The API key is loaded from .env.
-    """
-    ### YOUR CODE HERE
-    return None
+    from langchain_core.output_parsers import StrOutputParser
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_deepseek import ChatDeepSeek
+    model = ChatDeepSeek(
+        model="deepseek-v4-flash-vision-exp",
+        temperature=0,
+        max_retries=2,
+    )
+    task = """
+Read one supermarket receipt and return JSON only:
+{{"final_payment":"102.30","subtotal":"102.31",
+"discounts":["5.39"],"check_without_discount":"107.70"}}
+final_payment: actual payment after ROUNDING.
+subtotal: SUBTOTAL before ROUNDING.
+discounts: positive amounts of all discounts, promotions, coupons and savings.
+Exclude ROUNDING, change, points, balances and item prices.
+check_without_discount = subtotal + sum(discounts).
+Use decimal strings only.
+""".strip()
+    extract_prompt = ChatPromptTemplate.from_messages([
+        ("system", "Accurately extract amounts from English or Chinese receipts."),
+        ("human", [
+            {"type": "text", "text": task},
+            {
+                "type": "image_url",
+                "image_url": {"url": "{image_url}"},
+            },
+        ]),
+    ])
+    repair_prompt = ChatPromptTemplate.from_messages([
+        ("system", "Check the receipt and correct the draft JSON."),
+        ("human", [
+            {
+                "type": "text",
+                "text": task + "\nDraft:\n{draft}",
+            },
+            {
+                "type": "image_url",
+                "image_url": {"url": "{image_url}"},
+            },
+        ]),
+    ])
+    parser = StrOutputParser()
+    return {
+        "extract": (
+            extract_prompt | model | parser
+        ).with_retry(stop_after_attempt=2),
+        "repair": (
+            repair_prompt | model | parser
+        ).with_retry(stop_after_attempt=2),
+    }
 
 
 def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
-    """Run your chain and return one response for each exact query string.
-
-    ``images`` contains every receipt in the selected folder. A valid return
-    value looks like:
-
-        {QUERY_1: "HK$123.40", QUERY_2: "HK$150.00"}
-
-    Use the provided ``image_data_url(path)`` helper to put local images in
-    multimodal human messages. LangChain's ``batch`` method is one simple way
-    to process independent receipt-extraction prompts in parallel.
-    """
-    ### YOUR CODE HERE
-    _ = (chain, images)
-    return {QUERY_1: DUMMY_RESPONSE, QUERY_2: DUMMY_RESPONSE}
+    def parse(raw: Any) -> tuple[Decimal, Decimal]:
+        text = response_text(raw)
+        data = json.loads(
+            text[text.find("{"):text.rfind("}") + 1]
+        )
+        def money(value: Any) -> Decimal:
+            match = re.search(
+                r"-?\d[\d,]*(?:\.\d+)?",
+                str(value),
+            )
+            if not match:
+                raise ValueError
+            return Decimal(
+                match.group().replace(",", "")
+            )
+        paid = money(data["final_payment"])
+        subtotal = money(data["subtotal"])
+        discounts = sum(
+            (
+                abs(money(value))
+                for value in data["discounts"]
+            ),
+            Decimal("0"),
+        )
+        full_price = subtotal + discounts
+        if abs(
+            full_price
+            - money(data["check_without_discount"])
+        ) > Decimal("0.01"):
+            raise ValueError
+        return paid, full_price
+    inputs = [
+        {"image_url": image_data_url(image)}
+        for image in images
+    ]
+    outputs = chain["extract"].batch(
+        inputs,
+        config={"max_concurrency": 3},
+        return_exceptions=True,
+    )
+    total_paid = Decimal("0")
+    total_full_price = Decimal("0")
+    for values, output in zip(inputs, outputs):
+        try:
+            paid, full_price = parse(output)
+        except Exception:
+            try:
+                repaired = chain["repair"].invoke({
+                    "image_url": values["image_url"],
+                    "draft": response_text(output),
+                })
+                paid, full_price = parse(repaired)
+            except Exception:
+                paid = Decimal("0")
+                full_price = Decimal("0")
+        total_paid += paid
+        total_full_price += full_price
+    return {
+        QUERY_1: f"HK${total_paid:.2f}",
+        QUERY_2: f"HK${total_full_price:.2f}",
+    }
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
