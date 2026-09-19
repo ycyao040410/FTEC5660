@@ -60,10 +60,11 @@ def build_chain() -> Any:
     model = ChatDeepSeek(
         model="deepseek-v4-flash-vision-exp",
         temperature=0,
-        max_tokens=1500,
+        max_tokens=4096,
         timeout=60,
         max_retries=1,
-    )
+        extra_body={"thinking": {"type": "disabled"}},
+    ).bind(response_format={"type": "json_object"})
 
     task = """
 Read this receipt and return JSON only:
